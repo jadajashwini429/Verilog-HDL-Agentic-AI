@@ -40,4 +40,4 @@ def generate(body: GenerateRequest):
 
 @app.get("/")
 def index():
-    return FileResponse(FRONTEND / "index.html")
+    return FileResponse("/app/index.html")
