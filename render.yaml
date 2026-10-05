@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: verilog-agentic-ai
+    runtime: docker
+    plan: free
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: MAX_REPAIR_ATTEMPTS
+        value: "2"

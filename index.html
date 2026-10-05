@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Verilog Agentic AI</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, sans-serif; background: #f4f6f8; color: #17202a; }
+    header { padding: 28px 20px; background: #17202a; color: white; }
+    .wrap { max-width: 1100px; margin: auto; }
+    h1 { margin: 0 0 8px; font-size: 30px; }
+    header p { margin: 0; opacity: .85; }
+    main { padding: 24px 16px 50px; }
+    .card { background: white; border-radius: 14px; padding: 20px; margin-bottom: 18px; box-shadow: 0 3px 16px rgba(0,0,0,.07); }
+    textarea { width: 100%; min-height: 130px; padding: 14px; border: 1px solid #ccd3da; border-radius: 10px; font-size: 16px; resize: vertical; }
+    button { margin-top: 12px; border: 0; border-radius: 9px; padding: 12px 20px; font-size: 16px; cursor: pointer; background: #17202a; color: white; }
+    button:disabled { opacity: .5; cursor: wait; }
+    .status { font-weight: bold; padding: 10px 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    pre { background: #111820; color: #e8eef3; padding: 16px; border-radius: 10px; overflow: auto; min-height: 240px; white-space: pre-wrap; }
+    .hidden { display: none; }
+    .questions { background: #fff6d8; border-left: 5px solid #e2b93b; padding: 12px 16px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<header><div class="wrap"><h1>Verilog Agentic AI</h1><p>Natural-language requirement → Verilog RTL → testbench → compile/simulate → automatic repair</p></div></header>
+<main class="wrap">
+  <section class="card">
+    <h2>Hardware Requirement</h2>
+    <textarea id="request" placeholder="Example: Design a 2-to-1 multiplexer with inputs in0 and in1, select sel, and output out. When sel=0 choose in0; when sel=1 choose in1."></textarea>
+    <button id="generate" onclick="generateVerilog()">Generate Verilog</button>
+    <div id="status" class="status"></div>
+    <div id="questions" class="questions hidden"></div>
+  </section>
+  <section id="results" class="hidden">
+    <div class="grid">
+      <div class="card"><h2>Verilog RTL</h2><pre id="rtl"></pre></div>
+      <div class="card"><h2>Testbench</h2><pre id="tb"></pre></div>
+    </div>
+    <div class="card"><h2>Final Report</h2><pre id="report"></pre></div>
+  </section>
+</main>
+<script>
+async function generateVerilog() {
+  const request = document.getElementById('request').value.trim();
+  const btn = document.getElementById('generate');
+  const status = document.getElementById('status');
+  const results = document.getElementById('results');
+  const questions = document.getElementById('questions');
+  if (!request) { status.textContent = 'Please enter a hardware requirement.'; return; }
+  btn.disabled = true;
+  status.textContent = 'Agents are working: understanding → RTL → testbench → verification...';
+  questions.classList.add('hidden');
+  results.classList.add('hidden');
+  try {
+    const response = await fetch('/generate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_request: request})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Generation failed');
+    status.textContent = data.verification_status || 'Completed';
+    if (data.verification_status === 'NEEDS_CLARIFICATION') {
+      questions.innerHTML = '<b>Please clarify:</b><ul>' + (data.final_report.questions || []).map(q => '<li>' + escapeHtml(q) + '</li>').join('') + '</ul>';
+      questions.classList.remove('hidden');
+      return;
+    }
+    document.getElementById('rtl').textContent = data.rtl_code || '';
+    document.getElementById('tb').textContent = data.testbench_code || '';
+    document.getElementById('report').textContent = JSON.stringify(data.final_report || {}, null, 2);
+    results.classList.remove('hidden');
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  } finally { btn.disabled = false; }
+}
+function escapeHtml(s) { return s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+</script>
+</body>
+</html>
