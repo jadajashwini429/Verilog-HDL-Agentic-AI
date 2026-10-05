@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .agent import run_verilog_agent
+from agent import run_verilog_agent
 
 app = FastAPI(title="Verilog Agentic AI", version="2.0.0")
 
