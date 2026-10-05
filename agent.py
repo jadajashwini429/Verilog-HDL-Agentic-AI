@@ -1,4 +1,3 @@
-````python
 import json
 import os
 import re
@@ -54,8 +53,14 @@ class VerilogAgent:
 
         self.client = genai.Client(api_key=key)
 
-    def llm(self, system: str, user: str, temperature: float = 0.2) -> str:
-        """Call the Gemini API with retry handling for temporary failures."""
+    def llm(
+        self,
+        system: str,
+        user: str,
+        temperature: float = 0.2,
+        retries: int = 3,
+    ) -> str:
+        """Call the LLM with retry handling for temporary API failures."""
 
         prompt = (
             f"SYSTEM ROLE:\n{system}\n\n"
@@ -64,9 +69,9 @@ class VerilogAgent:
             "Do not add explanations unless explicitly requested."
         )
 
-        max_retries = 3
+        last_error = None
 
-        for attempt in range(max_retries):
+        for attempt in range(retries):
             try:
                 response = self.client.models.generate_content(
                     model=MODEL,
@@ -81,44 +86,55 @@ class VerilogAgent:
 
                 return text.strip()
 
-            except Exception as e:
-                error_message = str(e).lower()
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc).lower()
 
-                # Temporary Gemini API errors that are safe to retry.
-                retryable_error = (
-                    "503" in error_message
-                    or "unavailable" in error_message
-                    or "429" in error_message
-                    or "resource exhausted" in error_message
+                temporary_error = any(
+                    keyword in error_text
+                    for keyword in [
+                        "503",
+                        "unavailable",
+                        "429",
+                        "resource exhausted",
+                        "high demand",
+                        "temporarily",
+                    ]
                 )
 
-                if retryable_error and attempt < max_retries - 1:
-                    delay = 2 ** attempt
-                    time.sleep(delay)
-                    continue
+                if not temporary_error or attempt == retries - 1:
+                    raise
 
-                raise
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
 
-        raise RuntimeError("Gemini API request failed after multiple retries.")
+        raise RuntimeError(f"LLM request failed: {last_error}")
 
     @staticmethod
     def clean_code(text: str, language: str = "verilog") -> str:
+        """Remove accidental Markdown code fences from generated code."""
+
         text = text.strip()
 
-        # Remove fenced code blocks if the model added them.
         text = re.sub(
             r"^```(?:verilog|systemverilog|v)?\s*",
             "",
             text,
-            flags=re.I,
+            flags=re.IGNORECASE,
         )
 
-        text = re.sub(r"\s*```$", "", text)
+        text = re.sub(
+            r"\s*```$",
+            "",
+            text,
+        )
 
         return text.strip()
 
     @staticmethod
     def parse_json(text: str) -> Dict[str, Any]:
+        """Parse JSON even if the model accidentally adds code fences."""
+
         text = text.strip()
 
         if text.startswith("```"):
@@ -126,16 +142,15 @@ class VerilogAgent:
                 r"^```(?:json)?\s*",
                 "",
                 text,
-                flags=re.I,
+                flags=re.IGNORECASE,
             )
-
             text = re.sub(r"\s*```$", "", text)
 
         try:
             return json.loads(text)
 
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.S)
+            match = re.search(r"\{.*\}", text, re.DOTALL)
 
             if match:
                 return json.loads(match.group(0))
@@ -143,12 +158,21 @@ class VerilogAgent:
             raise
 
     def understand(self, request: str) -> Dict[str, Any]:
+        """Convert the user's natural-language request into a hardware specification."""
+
         system = """You are the Requirement Understanding Agent for a Verilog HDL automation system.
+
 Convert natural-language hardware requirements into a precise implementable specification.
-If critical information is missing, do NOT invent it. Set clarification_needed=true and provide concise questions.
+
+If critical information is missing, do NOT invent it.
+Set clarification_needed=true and provide concise questions.
+
 If enough information exists, infer only conventional details and set clarification_needed=false.
+
 Target Verilog-2001/Verilog HDL, not SystemVerilog.
+
 Return JSON only with exactly these fields:
+
 {
   "clarification_needed": boolean,
   "clarification_questions": [string],
@@ -164,7 +188,11 @@ Return JSON only with exactly these fields:
 }"""
 
         spec = self.parse_json(
-            self.llm(system, request, 0.1)
+            self.llm(
+                system,
+                request,
+                temperature=0.1,
+            )
         )
 
         spec.setdefault("parameters", [])
@@ -177,14 +205,22 @@ Return JSON only with exactly these fields:
         return spec
 
     def generate_rtl(self, spec: Dict[str, Any]) -> str:
-        system = """You are the RTL Generation Agent. Generate synthesizable Verilog HDL only.
+        """Generate synthesizable Verilog RTL."""
+
+        system = """You are the RTL Generation Agent.
+
+Generate synthesizable Verilog HDL only.
+
 Rules:
 - Use Verilog HDL (Verilog-2001), not SystemVerilog.
 - Generate exactly one top-level module using the specified module_name.
 - Match every port name and width in the specification exactly.
-- No testbench, markdown, comments about the AI, or explanation outside the code.
+- No testbench.
+- No markdown.
+- No explanation outside the code.
 - Prefer simple synthesizable constructs.
-- For combinational logic use assign/always @*; for sequential logic use always @(posedge clock) and the specified reset behavior.
+- For combinational logic use assign or always @*.
+- For sequential logic use always @(posedge clock) and the specified reset behavior.
 - Do not create undeclared ports or signals.
 - Finish with endmodule."""
 
@@ -192,7 +228,7 @@ Rules:
             self.llm(
                 system,
                 json.dumps(spec, indent=2),
-                0.15,
+                temperature=0.15,
             )
         )
 
@@ -201,16 +237,20 @@ Rules:
         spec: Dict[str, Any],
         rtl: str,
     ) -> str:
+        """Generate a Verilog-2001 testbench for the generated RTL."""
 
         system = """You are the Verification/Testbench Agent for Verilog HDL.
+
 Generate a self-contained Verilog-2001 testbench for the supplied DUT.
+
 Rules:
 - Testbench module must be named tb_<dut_module_name>.
 - Instantiate the DUT using exactly its declared ports.
 - Exercise representative normal cases and important boundary/corner cases.
 - For combinational circuits, use deterministic checks with if statements and $display.
 - For sequential circuits, generate the required clock/reset and allow enough simulation time.
-- The testbench must print exactly VERIFICATION_PASS if all checks pass and VERIFICATION_FAIL if any check fails.
+- The testbench must print exactly VERIFICATION_PASS if all checks pass.
+- The testbench must print VERIFICATION_FAIL if any check fails.
 - End with $finish.
 - Do not use SystemVerilog-only features.
 - Return code only."""
@@ -227,7 +267,7 @@ Rules:
             self.llm(
                 system,
                 payload,
-                0.2,
+                temperature=0.2,
             )
         )
 
@@ -236,7 +276,7 @@ Rules:
         rtl: str,
         tb: str,
     ) -> Tuple[bool, str, str]:
-        """Compile and simulate in a temporary isolated workspace."""
+        """Compile and simulate the generated Verilog in an isolated workspace."""
 
         with tempfile.TemporaryDirectory(
             prefix="verilog_agent_"
@@ -329,17 +369,26 @@ Rules:
         stage: str,
         log: str,
     ) -> Tuple[str, str]:
+        """Repair RTL and/or testbench after a verification failure."""
 
         system = """You are the Debug and Repair Agent for a Verilog generation pipeline.
+
 A generated design/testbench failed compilation or simulation.
+
 Analyze the failure and return JSON only:
-{"rtl_code":"...", "testbench_code":"..."}
+
+{
+  "rtl_code": "...",
+  "testbench_code": "..."
+}
+
 Rules:
 - Preserve the user's intended behavior.
 - Fix only what is necessary.
 - Keep Verilog-2001 compatibility.
 - Ensure the DUT/testbench interfaces agree exactly.
-- Ensure the testbench prints VERIFICATION_PASS on success and VERIFICATION_FAIL on failure.
+- Ensure the testbench prints VERIFICATION_PASS on success.
+- Ensure the testbench prints VERIFICATION_FAIL on failure.
 - Never put markdown fences around code inside the JSON strings."""
 
         payload = json.dumps(
@@ -357,20 +406,28 @@ Rules:
             self.llm(
                 system,
                 payload,
-                0.1,
+                temperature=0.1,
             )
         )
 
+        repaired_rtl = result.get(
+            "rtl_code",
+            rtl,
+        )
+
+        repaired_tb = result.get(
+            "testbench_code",
+            tb,
+        )
+
         return (
-            self.clean_code(
-                result.get("rtl_code", rtl)
-            ),
-            self.clean_code(
-                result.get("testbench_code", tb)
-            ),
+            self.clean_code(repaired_rtl),
+            self.clean_code(repaired_tb),
         )
 
     def run(self, request: str) -> AgentResult:
+        """Run the complete Verilog generation and verification pipeline."""
+
         spec = self.understand(request)
 
         if spec.get("clarification_needed"):
@@ -393,6 +450,7 @@ Rules:
             )
 
         rtl = self.generate_rtl(spec)
+
         tb = self.generate_testbench(
             spec,
             rtl,
@@ -411,7 +469,6 @@ Rules:
                 )
 
             except FileNotFoundError:
-                # Local Colab may not have Icarus until the setup cell is executed.
                 return AgentResult(
                     verification_status="GENERATED_NOT_SIMULATED",
                     rtl_code=rtl,
@@ -433,8 +490,8 @@ Rules:
                 ok = False
                 stage = "SIMULATION_TIMEOUT"
                 log = (
-                    "Simulation exceeded the 20 second "
-                    "safety limit."
+                    "Simulation exceeded the "
+                    "20 second safety limit."
                 )
 
             history.append(
@@ -492,10 +549,10 @@ Rules:
 def run_verilog_agent(
     user_request: str,
 ) -> Dict[str, Any]:
+    """Entry point used by the FastAPI application."""
 
     result = VerilogAgent().run(
         user_request
     )
 
     return asdict(result)
-````
