@@ -1,8 +1,10 @@
+````python
 import json
 import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -43,44 +45,101 @@ class VerilogAgent:
 
     def __init__(self, api_key: str | None = None):
         key = api_key or os.getenv("GEMINI_API_KEY")
+
         if not key:
             raise RuntimeError("GEMINI_API_KEY is not configured.")
+
         if genai is None:
             raise RuntimeError("google-genai is not installed.")
+
         self.client = genai.Client(api_key=key)
 
     def llm(self, system: str, user: str, temperature: float = 0.2) -> str:
-        prompt = f"""SYSTEM ROLE:\n{system}\n\nUSER INPUT:\n{user}\n\nReturn only the requested output. Do not add explanations unless explicitly requested."""
-        response = self.client.models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config={"temperature": temperature},
+        """Call the Gemini API with retry handling for temporary failures."""
+
+        prompt = (
+            f"SYSTEM ROLE:\n{system}\n\n"
+            f"USER INPUT:\n{user}\n\n"
+            "Return only the requested output. "
+            "Do not add explanations unless explicitly requested."
         )
-        text = getattr(response, "text", None)
-        if not text:
-            raise RuntimeError("The model returned an empty response.")
-        return text.strip()
+
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=MODEL,
+                    contents=prompt,
+                    config={"temperature": temperature},
+                )
+
+                text = getattr(response, "text", None)
+
+                if not text:
+                    raise RuntimeError("The model returned an empty response.")
+
+                return text.strip()
+
+            except Exception as e:
+                error_message = str(e).lower()
+
+                # Temporary Gemini API errors that are safe to retry.
+                retryable_error = (
+                    "503" in error_message
+                    or "unavailable" in error_message
+                    or "429" in error_message
+                    or "resource exhausted" in error_message
+                )
+
+                if retryable_error and attempt < max_retries - 1:
+                    delay = 2 ** attempt
+                    time.sleep(delay)
+                    continue
+
+                raise
+
+        raise RuntimeError("Gemini API request failed after multiple retries.")
 
     @staticmethod
     def clean_code(text: str, language: str = "verilog") -> str:
         text = text.strip()
+
         # Remove fenced code blocks if the model added them.
-        text = re.sub(r"^```(?:verilog|systemverilog|v)?\s*", "", text, flags=re.I)
+        text = re.sub(
+            r"^```(?:verilog|systemverilog|v)?\s*",
+            "",
+            text,
+            flags=re.I,
+        )
+
         text = re.sub(r"\s*```$", "", text)
+
         return text.strip()
 
     @staticmethod
     def parse_json(text: str) -> Dict[str, Any]:
         text = text.strip()
+
         if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+            text = re.sub(
+                r"^```(?:json)?\s*",
+                "",
+                text,
+                flags=re.I,
+            )
+
             text = re.sub(r"\s*```$", "", text)
+
         try:
             return json.loads(text)
+
         except json.JSONDecodeError:
             match = re.search(r"\{.*\}", text, re.S)
+
             if match:
                 return json.loads(match.group(0))
+
             raise
 
     def understand(self, request: str) -> Dict[str, Any]:
@@ -103,13 +162,18 @@ Return JSON only with exactly these fields:
   "reset": string,
   "assumptions": [string]
 }"""
-        spec = self.parse_json(self.llm(system, request, 0.1))
+
+        spec = self.parse_json(
+            self.llm(system, request, 0.1)
+        )
+
         spec.setdefault("parameters", [])
         spec.setdefault("inputs", [])
         spec.setdefault("outputs", [])
         spec.setdefault("behavior", [])
         spec.setdefault("assumptions", [])
         spec.setdefault("clarification_questions", [])
+
         return spec
 
     def generate_rtl(self, spec: Dict[str, Any]) -> str:
@@ -123,9 +187,21 @@ Rules:
 - For combinational logic use assign/always @*; for sequential logic use always @(posedge clock) and the specified reset behavior.
 - Do not create undeclared ports or signals.
 - Finish with endmodule."""
-        return self.clean_code(self.llm(system, json.dumps(spec, indent=2), 0.15))
 
-    def generate_testbench(self, spec: Dict[str, Any], rtl: str) -> str:
+        return self.clean_code(
+            self.llm(
+                system,
+                json.dumps(spec, indent=2),
+                0.15,
+            )
+        )
+
+    def generate_testbench(
+        self,
+        spec: Dict[str, Any],
+        rtl: str,
+    ) -> str:
+
         system = """You are the Verification/Testbench Agent for Verilog HDL.
 Generate a self-contained Verilog-2001 testbench for the supplied DUT.
 Rules:
@@ -138,39 +214,122 @@ Rules:
 - End with $finish.
 - Do not use SystemVerilog-only features.
 - Return code only."""
-        payload = json.dumps({"spec": spec, "rtl": rtl}, indent=2)
-        return self.clean_code(self.llm(system, payload, 0.2))
 
-    def run_tools(self, rtl: str, tb: str) -> Tuple[bool, str, str]:
+        payload = json.dumps(
+            {
+                "spec": spec,
+                "rtl": rtl,
+            },
+            indent=2,
+        )
+
+        return self.clean_code(
+            self.llm(
+                system,
+                payload,
+                0.2,
+            )
+        )
+
+    def run_tools(
+        self,
+        rtl: str,
+        tb: str,
+    ) -> Tuple[bool, str, str]:
         """Compile and simulate in a temporary isolated workspace."""
-        with tempfile.TemporaryDirectory(prefix="verilog_agent_") as td:
+
+        with tempfile.TemporaryDirectory(
+            prefix="verilog_agent_"
+        ) as td:
+
             root = Path(td)
+
             rtl_path = root / "design.v"
             tb_path = root / "testbench.v"
             out_path = root / "sim.out"
-            rtl_path.write_text(rtl, encoding="utf-8")
-            tb_path.write_text(tb, encoding="utf-8")
+
+            rtl_path.write_text(
+                rtl,
+                encoding="utf-8",
+            )
+
+            tb_path.write_text(
+                tb,
+                encoding="utf-8",
+            )
 
             compile_proc = subprocess.run(
-                [IVERILOG, "-g2005-s", "-o", str(out_path), str(rtl_path), str(tb_path)],
-                capture_output=True, text=True, timeout=20,
+                [
+                    IVERILOG,
+                    "-g2005-s",
+                    "-o",
+                    str(out_path),
+                    str(rtl_path),
+                    str(tb_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
             )
-            compile_log = (compile_proc.stdout + "\n" + compile_proc.stderr).strip()
+
+            compile_log = (
+                compile_proc.stdout
+                + "\n"
+                + compile_proc.stderr
+            ).strip()
+
             if compile_proc.returncode != 0:
-                return False, "COMPILE_ERROR", compile_log
+                return (
+                    False,
+                    "COMPILE_ERROR",
+                    compile_log,
+                )
 
             sim_proc = subprocess.run(
-                [VVP, str(out_path)],
-                capture_output=True, text=True, timeout=20,
+                [
+                    VVP,
+                    str(out_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
             )
-            sim_log = (sim_proc.stdout + "\n" + sim_proc.stderr).strip()
-            if sim_proc.returncode != 0:
-                return False, "SIMULATION_ERROR", sim_log
-            if "VERIFICATION_PASS" not in sim_log:
-                return False, "VERIFICATION_FAIL", sim_log
-            return True, "VERIFICATION_PASS", sim_log
 
-    def repair(self, spec: Dict[str, Any], rtl: str, tb: str, stage: str, log: str) -> Tuple[str, str]:
+            sim_log = (
+                sim_proc.stdout
+                + "\n"
+                + sim_proc.stderr
+            ).strip()
+
+            if sim_proc.returncode != 0:
+                return (
+                    False,
+                    "SIMULATION_ERROR",
+                    sim_log,
+                )
+
+            if "VERIFICATION_PASS" not in sim_log:
+                return (
+                    False,
+                    "VERIFICATION_FAIL",
+                    sim_log,
+                )
+
+            return (
+                True,
+                "VERIFICATION_PASS",
+                sim_log,
+            )
+
+    def repair(
+        self,
+        spec: Dict[str, Any],
+        rtl: str,
+        tb: str,
+        stage: str,
+        log: str,
+    ) -> Tuple[str, str]:
+
         system = """You are the Debug and Repair Agent for a Verilog generation pipeline.
 A generated design/testbench failed compilation or simulation.
 Analyze the failure and return JSON only:
@@ -182,18 +341,38 @@ Rules:
 - Ensure the DUT/testbench interfaces agree exactly.
 - Ensure the testbench prints VERIFICATION_PASS on success and VERIFICATION_FAIL on failure.
 - Never put markdown fences around code inside the JSON strings."""
-        payload = json.dumps({
-            "spec": spec,
-            "failure_stage": stage,
-            "failure_log": log,
-            "rtl_code": rtl,
-            "testbench_code": tb,
-        }, indent=2)
-        result = self.parse_json(self.llm(system, payload, 0.1))
-        return self.clean_code(result.get("rtl_code", rtl)), self.clean_code(result.get("testbench_code", tb))
+
+        payload = json.dumps(
+            {
+                "spec": spec,
+                "failure_stage": stage,
+                "failure_log": log,
+                "rtl_code": rtl,
+                "testbench_code": tb,
+            },
+            indent=2,
+        )
+
+        result = self.parse_json(
+            self.llm(
+                system,
+                payload,
+                0.1,
+            )
+        )
+
+        return (
+            self.clean_code(
+                result.get("rtl_code", rtl)
+            ),
+            self.clean_code(
+                result.get("testbench_code", tb)
+            ),
+        )
 
     def run(self, request: str) -> AgentResult:
         spec = self.understand(request)
+
         if spec.get("clarification_needed"):
             return AgentResult(
                 verification_status="NEEDS_CLARIFICATION",
@@ -202,18 +381,35 @@ Rules:
                 hardware_spec=spec,
                 final_report={
                     "status": "NEEDS_CLARIFICATION",
-                    "message": "The requirement is missing information needed to generate reliable HDL.",
-                    "questions": spec.get("clarification_questions", []),
+                    "message": (
+                        "The requirement is missing information "
+                        "needed to generate reliable HDL."
+                    ),
+                    "questions": spec.get(
+                        "clarification_questions",
+                        [],
+                    ),
                 },
             )
 
         rtl = self.generate_rtl(spec)
-        tb = self.generate_testbench(spec, rtl)
+        tb = self.generate_testbench(
+            spec,
+            rtl,
+        )
+
         history = []
 
-        for attempt in range(MAX_REPAIR_ATTEMPTS + 1):
+        for attempt in range(
+            MAX_REPAIR_ATTEMPTS + 1
+        ):
+
             try:
-                ok, stage, log = self.run_tools(rtl, tb)
+                ok, stage, log = self.run_tools(
+                    rtl,
+                    tb,
+                )
+
             except FileNotFoundError:
                 # Local Colab may not have Icarus until the setup cell is executed.
                 return AgentResult(
@@ -224,14 +420,31 @@ Rules:
                     attempts=attempt,
                     final_report={
                         "status": "GENERATED_NOT_SIMULATED",
-                        "message": "RTL and testbench were generated, but Icarus Verilog is not installed on this runtime.",
+                        "message": (
+                            "RTL and testbench were generated, "
+                            "but Icarus Verilog is not installed "
+                            "on this runtime."
+                        ),
                         "history": history,
                     },
                 )
-            except subprocess.TimeoutExpired:
-                ok, stage, log = False, "SIMULATION_TIMEOUT", "Simulation exceeded the 20 second safety limit."
 
-            history.append({"attempt": attempt + 1, "stage": stage, "log": log[-4000:]})
+            except subprocess.TimeoutExpired:
+                ok = False
+                stage = "SIMULATION_TIMEOUT"
+                log = (
+                    "Simulation exceeded the 20 second "
+                    "safety limit."
+                )
+
+            history.append(
+                {
+                    "attempt": attempt + 1,
+                    "stage": stage,
+                    "log": log[-4000:],
+                }
+            )
+
             if ok:
                 return AgentResult(
                     verification_status="VERIFICATION_PASS",
@@ -241,12 +454,22 @@ Rules:
                     attempts=attempt + 1,
                     final_report={
                         "status": "VERIFICATION_PASS",
-                        "message": "RTL compiled and the generated testbench passed simulation.",
+                        "message": (
+                            "RTL compiled and the generated "
+                            "testbench passed simulation."
+                        ),
                         "history": history,
                     },
                 )
+
             if attempt < MAX_REPAIR_ATTEMPTS:
-                rtl, tb = self.repair(spec, rtl, tb, stage, log)
+                rtl, tb = self.repair(
+                    spec,
+                    rtl,
+                    tb,
+                    stage,
+                    log,
+                )
 
         return AgentResult(
             verification_status="VERIFICATION_FAIL",
@@ -256,12 +479,23 @@ Rules:
             attempts=MAX_REPAIR_ATTEMPTS + 1,
             final_report={
                 "status": "VERIFICATION_FAIL",
-                "message": "Generation completed but automatic repair could not make the design pass verification.",
+                "message": (
+                    "Generation completed but automatic "
+                    "repair could not make the design "
+                    "pass verification."
+                ),
                 "history": history,
             },
         )
 
 
-def run_verilog_agent(user_request: str) -> Dict[str, Any]:
-    result = VerilogAgent().run(user_request)
+def run_verilog_agent(
+    user_request: str,
+) -> Dict[str, Any]:
+
+    result = VerilogAgent().run(
+        user_request
+    )
+
     return asdict(result)
+````
