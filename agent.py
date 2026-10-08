@@ -15,10 +15,21 @@ except ImportError:
 
 
 # ============================================================
-# CONFIGURATION
+# GEMINI CONFIGURATION
 # ============================================================
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+# Try the lightweight/high-throughput model first.
+# If Google returns 503/429, automatically try the next model.
+MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+]
+
+LLM_RETRIES_PER_MODEL = int(
+    os.getenv("LLM_RETRIES_PER_MODEL", "2")
+)
 
 MAX_REPAIR_ATTEMPTS = int(
     os.getenv("MAX_REPAIR_ATTEMPTS", "2")
@@ -32,10 +43,6 @@ IVERILOG = os.getenv(
 VVP = os.getenv(
     "VVP_PATH",
     "vvp"
-)
-
-LLM_RETRIES = int(
-    os.getenv("LLM_RETRIES", "4")
 )
 
 
@@ -58,24 +65,15 @@ class AgentResult:
 # ============================================================
 
 class VerilogAgent:
-    """
-    Multi-stage Verilog generation and verification agent.
 
-    Pipeline:
+    def __init__(
+        self,
+        api_key: str | None = None
+    ):
 
-    1. Requirement understanding
-    2. RTL generation
-    3. Testbench generation
-    4. Compilation
-    5. Simulation
-    6. Automatic repair
-    7. Final report
-    """
-
-    def __init__(self, api_key: str | None = None):
-
-        key = api_key or os.getenv(
-            "GEMINI_API_KEY"
+        key = (
+            api_key
+            or os.getenv("GEMINI_API_KEY")
         )
 
         if not key:
@@ -93,7 +91,7 @@ class VerilogAgent:
         )
 
     # ========================================================
-    # LLM CALL
+    # LLM CALL WITH AUTOMATIC MODEL FALLBACK
     # ========================================================
 
     def llm(
@@ -113,87 +111,128 @@ class VerilogAgent:
 
         last_error = None
 
-        for attempt in range(LLM_RETRIES):
+        for model in MODELS:
 
-            try:
+            print(
+                f"[LLM] Trying model: {model}"
+            )
 
-                print(
-                    f"[LLM] Requesting {MODEL} "
-                    f"(attempt {attempt + 1}/{LLM_RETRIES})"
-                )
+            for attempt in range(
+                LLM_RETRIES_PER_MODEL
+            ):
 
-                # IMPORTANT:
-                # Gemini 3.7 does NOT use the old
-                # temperature/top_p/top_k parameters.
-                response = self.client.models.generate_content(
-                    model=MODEL,
-                    contents=prompt,
-                )
+                try:
 
-                text = getattr(
-                    response,
-                    "text",
-                    None
-                )
-
-                if not text:
-                    raise RuntimeError(
-                        "The model returned an empty response."
+                    print(
+                        f"[LLM] Attempt "
+                        f"{attempt + 1}/"
+                        f"{LLM_RETRIES_PER_MODEL}"
                     )
 
-                print(
-                    "[LLM] Response received successfully."
-                )
+                    # IMPORTANT:
+                    # Gemini 3.x should not receive
+                    # the old temperature/top_p/top_k
+                    # sampling parameters.
+                    response = (
+                        self.client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                        )
+                    )
 
-                return text.strip()
+                    text = getattr(
+                        response,
+                        "text",
+                        None
+                    )
 
-            except Exception as exc:
+                    if not text:
 
-                last_error = exc
+                        raise RuntimeError(
+                            "The model returned an empty response."
+                        )
 
-                error_text = str(exc).lower()
+                    print(
+                        f"[LLM] SUCCESS using {model}"
+                    )
 
-                print(
-                    f"[LLM ERROR] {exc}"
-                )
+                    return text.strip()
 
-                temporary_error = any(
-                    keyword in error_text
-                    for keyword in [
-                        "503",
-                        "unavailable",
-                        "429",
-                        "resource exhausted",
-                        "high demand",
-                        "temporarily",
-                        "deadline",
-                        "timeout",
-                    ]
-                )
+                except Exception as exc:
 
-                if not temporary_error:
-                    raise
+                    last_error = exc
 
-                if attempt == LLM_RETRIES - 1:
-                    break
+                    error_text = (
+                        str(exc).lower()
+                    )
 
-                # Exponential backoff:
-                # 2s, 4s, 8s...
-                wait_time = min(
-                    2 ** attempt,
-                    15
-                )
+                    print(
+                        f"[LLM ERROR] {exc}"
+                    )
 
-                print(
-                    f"[LLM] Temporary failure. "
-                    f"Retrying in {wait_time} seconds..."
-                )
+                    temporary_error = any(
+                        keyword in error_text
+                        for keyword in [
+                            "503",
+                            "unavailable",
+                            "429",
+                            "resource exhausted",
+                            "high demand",
+                            "temporarily",
+                            "deadline",
+                            "timeout",
+                        ]
+                    )
 
-                time.sleep(wait_time)
+                    # ------------------------------------------------
+                    # Non-temporary error
+                    # ------------------------------------------------
+
+                    if not temporary_error:
+
+                        raise
+
+                    # ------------------------------------------------
+                    # Temporary error
+                    # ------------------------------------------------
+
+                    if (
+                        attempt
+                        < LLM_RETRIES_PER_MODEL - 1
+                    ):
+
+                        wait_time = min(
+                            2 ** attempt,
+                            8
+                        )
+
+                        print(
+                            f"[LLM] Temporary error. "
+                            f"Retrying {model} in "
+                            f"{wait_time} seconds..."
+                        )
+
+                        time.sleep(
+                            wait_time
+                        )
+
+            # ----------------------------------------------------
+            # Current model failed.
+            # Move to the next model.
+            # ----------------------------------------------------
+
+            print(
+                f"[LLM] {model} unavailable. "
+                f"Trying next model..."
+            )
+
+        # --------------------------------------------------------
+        # ALL MODELS FAILED
+        # --------------------------------------------------------
 
         raise RuntimeError(
-            f"LLM request failed after "
-            f"{LLM_RETRIES} attempts: {last_error}"
+            "All configured Gemini models failed. "
+            f"Last error: {last_error}"
         )
 
     # ========================================================
@@ -251,7 +290,9 @@ class VerilogAgent:
 
         try:
 
-            return json.loads(text)
+            return json.loads(
+                text
+            )
 
         except json.JSONDecodeError:
 
@@ -287,14 +328,16 @@ into a precise implementable specification.
 
 If critical information is missing:
 
-- Do NOT invent it.
-- Set clarification_needed=true.
-- Provide concise clarification questions.
+Do NOT invent it.
+
+Set clarification_needed=true and provide
+concise clarification questions.
 
 If enough information exists:
 
-- Infer only conventional details.
-- Set clarification_needed=false.
+Infer only conventional details.
+
+Set clarification_needed=false.
 
 Target Verilog-2001/Verilog HDL,
 not SystemVerilog.
@@ -503,9 +546,17 @@ when any check fails.
 
             root = Path(td)
 
-            rtl_path = root / "design.v"
-            tb_path = root / "testbench.v"
-            out_path = root / "sim.out"
+            rtl_path = (
+                root / "design.v"
+            )
+
+            tb_path = (
+                root / "testbench.v"
+            )
+
+            out_path = (
+                root / "sim.out"
+            )
 
             rtl_path.write_text(
                 rtl,
@@ -577,7 +628,10 @@ when any check fails.
                     sim_log,
                 )
 
-            if "VERIFICATION_PASS" not in sim_log:
+            if (
+                "VERIFICATION_PASS"
+                not in sim_log
+            ):
 
                 return (
                     False,
@@ -592,7 +646,7 @@ when any check fails.
             )
 
     # ========================================================
-    # REPAIR
+    # AUTOMATIC REPAIR
     # ========================================================
 
     def repair(
@@ -628,7 +682,7 @@ Rules:
   on success.
 - Ensure the testbench prints VERIFICATION_FAIL
   on failure.
-- Never put Markdown fences around code
+- Never put markdown fences around code
   inside JSON strings.
 """
 
@@ -745,7 +799,7 @@ Rules:
         history = []
 
         # ----------------------------------------------------
-        # VERIFY + REPAIR LOOP
+        # VERIFICATION / REPAIR LOOP
         # ----------------------------------------------------
 
         for attempt in range(
@@ -760,9 +814,11 @@ Rules:
 
             try:
 
-                ok, stage, log = self.run_tools(
-                    rtl,
-                    tb,
+                ok, stage, log = (
+                    self.run_tools(
+                        rtl,
+                        tb,
+                    )
                 )
 
             except FileNotFoundError:
@@ -845,7 +901,10 @@ Rules:
             # REPAIR
             # ------------------------------------------------
 
-            if attempt < MAX_REPAIR_ATTEMPTS:
+            if (
+                attempt
+                < MAX_REPAIR_ATTEMPTS
+            ):
 
                 print(
                     "[AGENT] Attempting automatic repair..."
@@ -860,7 +919,7 @@ Rules:
                 )
 
         # ----------------------------------------------------
-        # FAILURE AFTER REPAIR
+        # FINAL FAILURE
         # ----------------------------------------------------
 
         return AgentResult(
