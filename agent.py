@@ -14,7 +14,7 @@ except ImportError:
     genai = None
 
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 MAX_REPAIR_ATTEMPTS = int(os.getenv("MAX_REPAIR_ATTEMPTS", "2"))
 IVERILOG = os.getenv("IVERILOG_PATH", "iverilog")
 VVP = os.getenv("VVP_PATH", "vvp")
